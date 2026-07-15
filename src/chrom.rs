@@ -66,7 +66,8 @@ impl ChromIndex {
         Self::parse(&text, bin_size, &path.display().to_string())
     }
 
-    fn parse(text: &str, bin_size: u32, path: &str) -> Result<Self, Error> {
+    /// Parse an already-read table. Lets tests build an index without a file.
+    pub(crate) fn parse(text: &str, bin_size: u32, path: &str) -> Result<Self, Error> {
         assert!(bin_size > 0, "bin_size must be positive");
         let mut chroms = Vec::new();
         let mut next_start: u32 = 1; // global bins are 1-based
