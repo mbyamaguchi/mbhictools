@@ -1,0 +1,15 @@
+[package]
+name = "mbhictools_rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.6.2", features = ["derive"] }
+memmap2 = "0.9.11"
+plotters = { version = "0.3.7", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "ttf", "all_series", "all_elements"] }
+rayon = "1.12.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

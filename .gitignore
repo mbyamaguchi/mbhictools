@@ -1,0 +1,10 @@
+/target
+
+# claude sama
+.claude/*
+
+# chatgpt sama
+.codex/*
+
+# output
+output/*
