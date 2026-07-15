@@ -1,6 +1,7 @@
-//! `draw_hic`: Hi-C contact map を PNG へ描く CLI。
+//! `draw_hic`: draws a Hi-C contact map to PNG.
 //!
-//! 集計と描画の実体は `mbhictools_rs` ライブラリ側にある。ここはその組み立てだけ。
+//! The aggregation and rendering live in the `mbhictools_rs` library; this only
+//! wires them together.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -13,79 +14,79 @@ use mbhictools_rs::font;
 use mbhictools_rs::grid::{self, GridSpec};
 use mbhictools_rs::render::{self, Labels, Palette, Scale};
 
-/// スパース接触データ (bin1<TAB>bin2<TAB>score) から Hi-C contact map を描く。
+/// Draw a Hi-C contact map from sparse contacts (bin1<TAB>bin2<TAB>score).
 ///
-/// 入力は上三角成分のみ・score >= 1 の整数・bin 間距離が上限以内、を前提とする。
-/// 距離が制限されているため、正方形ではなく 45 度回した三角形として描く
-/// (横 = ゲノム位置、縦 = 相互作用距離)。
+/// Assumes the upper triangle only, integer scores >= 1, and distances within a
+/// limit. Because distance is capped, the map is drawn not as a square but as a
+/// triangle rotated 45 degrees: genomic position across, interaction distance up.
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// 接触データ (TSV: bin1 bin2 score)
+    /// Contact data (TSV: bin1 bin2 score)
     input: PathBuf,
 
-    /// 出力 PNG
+    /// Output PNG
     #[arg(short, long, default_value = "hicmap.png")]
     output: PathBuf,
 
-    /// 横方向の画素数 (= 解像度)。1 画素が 1 bin を下回る指定は拒否する
+    /// Pixels across (the resolution). Below 1 bin per pixel is rejected
     #[arg(long, default_value_t = 4000)]
     nx: usize,
 
-    /// 表示するゲノム範囲の開始 (bin)。省略でデータ全域
+    /// Start of the genomic range shown (bins). Defaults to all data
     #[arg(long)]
     x_start: Option<f64>,
 
-    /// 表示するゲノム範囲の終了 (bin, この値は含まない)。省略でデータ全域
+    /// End of the genomic range shown (bins, exclusive). Defaults to all data
     #[arg(long)]
     x_end: Option<f64>,
 
-    /// 表示する最大の bin 間距離 (bin, この値を含む)。省略でデータ内の最大距離
+    /// Largest bin distance shown (bins, inclusive). Defaults to the data's largest
     #[arg(long)]
     max_distance: Option<f64>,
 
-    /// 染色体長ファイル (chr<TAB>bp)。指定すると軸を bp で目盛り、
-    /// 染色体境界を跨ぐ接触を除外して境界線を引く
+    /// Chromosome lengths (chr<TAB>bp). Labels axes in bp, drops contacts crossing
+    /// a chromosome boundary, and marks the boundaries
     #[arg(long)]
     lengths: Option<PathBuf>,
 
-    /// bp/bin。省略時は --lengths と最大 bin から推定する
+    /// bp per bin. Estimated from --lengths and the max bin when omitted
     #[arg(long)]
     bin_size: Option<u32>,
 
-    /// 染色体境界を跨ぐ接触も残す (--lengths 指定時のみ意味を持つ)
+    /// Keep contacts that cross a chromosome boundary (only affects --lengths)
     #[arg(long)]
     keep_inter: bool,
 
-    /// log10 をとらず生の score 総和で色をつける
+    /// Colour by the raw summed score instead of log10
     #[arg(long)]
     no_log: bool,
 
-    /// 上側をクリップする分位点 (0..1)
+    /// Quantile at which to clip the top (0..1)
     #[arg(long, default_value_t = 0.99)]
     trim_quantile: f64,
 
-    /// 上側のクリップを行わない
+    /// Do not clip the top at all
     #[arg(long)]
     no_trim: bool,
 
-    /// 図の見出し。省略で入力ファイル名
+    /// Figure title. Defaults to the input file name
     #[arg(long)]
     title: Option<String>,
 
-    /// ラベルに使うフォントファミリ。省略で使えるものを自動選択
+    /// Font family for labels. Auto-selected when omitted
     #[arg(long)]
     font: Option<String>,
 
-    /// 集計したグリッドを TSV へ書き出す (px py x y raw value)
+    /// Write the aggregated grid to TSV (px py x y raw value)
     #[arg(long)]
     dump_grid: Option<PathBuf>,
 
-    /// 総画素数の上限。グリッドは 8 バイト/画素を使う
+    /// Cap on total pixels. The grid costs 8 bytes each
     #[arg(long, default_value_t = 40_000_000)]
     max_pixels: usize,
 
-    /// 1 画素が 1 bin 未満でも描く (モアレを承知のうえで)
+    /// Render even below 1 bin per pixel, moire and all
     #[arg(long)]
     allow_aliasing: bool,
 }
@@ -94,7 +95,7 @@ fn main() -> ExitCode {
     match run(Args::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("エラー: {e}");
+            eprintln!("error: {e}");
             ExitCode::FAILURE
         }
     }
@@ -103,38 +104,38 @@ fn main() -> ExitCode {
 fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if !(0.0..=1.0).contains(&args.trim_quantile) {
         return Err(format!(
-            "--trim-quantile は 0..1 で指定してください (指定値: {})",
+            "--trim-quantile must be within 0..1 (got {})",
             args.trim_quantile
         )
         .into());
     }
     if args.nx == 0 {
-        return Err("--nx は 1 以上で指定してください".into());
+        return Err("--nx must be at least 1".into());
     }
 
-    // --- 1 パス目: データの広がりを調べる (範囲の自動決定と bin_size 推定のため) ---
-    eprintln!("[1/3] データの広がりを走査中: {}", args.input.display());
+    // --- Pass 1: measure the data, to resolve the range and estimate bin_size ---
+    eprintln!("[1/3] scanning extent: {}", args.input.display());
     let extent = grid::scan_extent(&args.input)?;
     eprintln!(
-        "      bin {}..{}, 最大距離 {} bin",
+        "      bins {}..{}, max distance {} bins",
         extent.bin_min, extent.bin_max, extent.dist_max
     );
 
-    // --- bin_size と染色体テーブル ---
+    // --- bin_size and the chromosome table ---
     let bin_size = resolve_bin_size(&args, &extent)?;
     let chroms = match (&args.lengths, bin_size) {
         (Some(path), Some(bs)) => {
             let idx = ChromIndex::load(path, bs)?;
             eprintln!(
-                "      染色体 {} 本 / 全 {} bin ({} bp/bin)",
+                "      {} chromosomes over {} bins ({} bp/bin)",
                 idx.chroms().len(),
                 idx.total_bins(),
                 bs
             );
             if extent.bin_max > idx.total_bins() {
                 eprintln!(
-                    "警告: データの最大 bin {} が染色体テーブルの全 bin 数 {} を超えています。\n\
-                     --bin-size が実際と食い違っている可能性があります",
+                    "warning: max bin {} exceeds the {} bins of the chromosome table; \
+                     --bin-size may be wrong",
                     extent.bin_max,
                     idx.total_bins()
                 );
@@ -144,30 +145,30 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
 
-    // --- 表示範囲を決める ---
-    // xr = (bin1 + bin2) / 2 の最大は bin_max なので、半開区間の上端は +1 して含める。
+    // --- Resolve the view ---
+    // xr = (bin1 + bin2) / 2 peaks at bin_max, so the half-open end is one past it.
     let x0 = args.x_start.unwrap_or(extent.bin_min as f64);
     let x1 = args.x_end.unwrap_or(extent.bin_max as f64 + 1.0);
     if x1 <= x0 {
-        return Err(format!("表示範囲が空です: [{x0}, {x1})").into());
+        return Err(format!("empty range: [{x0}, {x1})").into());
     }
     let max_distance = args.max_distance.unwrap_or(extent.dist_max as f64).max(1.0);
 
     let spec = GridSpec::new(x0, x1, max_distance, args.nx);
     report_geometry(&spec, bin_size);
 
-    // --- 画素数の検査 ---
+    // --- Check the pixel count ---
     if let Some(a) = spec.aliasing() {
         if args.allow_aliasing {
-            eprintln!("警告: {a}");
+            eprintln!("warning: {a}");
         } else {
-            return Err(format!("{a}\n(承知のうえで描くなら --allow-aliasing)").into());
+            return Err(format!("{a}\n(pass --allow-aliasing to render anyway)").into());
         }
     }
     if spec.pixels() > args.max_pixels {
         return Err(format!(
-            "画素数 {} が上限 {} を超えます (グリッドに {:.1} GB 必要)。\n\
-             --nx を下げるか --max-pixels を上げてください",
+            "{} pixels exceeds the cap of {} (the grid would need {:.1} GB).\n\
+             Lower --nx or raise --max-pixels",
             spec.pixels(),
             args.max_pixels,
             spec.pixels() as f64 * 8.0 / 1e9
@@ -175,8 +176,8 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    // --- 2 パス目: グリッドへ集計 ---
-    eprintln!("[2/3] グリッドへ集計中 ({} x {} 画素)", spec.nx, spec.ny);
+    // --- Pass 2: aggregate ---
+    eprintln!("[2/3] aggregating ({} x {} pixels)", spec.nx, spec.ny);
     let filter = if args.keep_inter {
         None
     } else {
@@ -184,20 +185,22 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     };
     let g = grid::build(&args.input, spec, filter)?;
     eprintln!(
-        "      集計 {} 行 / 範囲外 {} 行{}",
+        "      {} rows counted, {} out of range{}",
         g.counted,
         g.out_of_range,
         if g.inter_chrom > 0 {
-            format!(" / 染色体を跨ぎ除外 {} 行", g.inter_chrom)
+            format!(", {} dropped crossing chromosomes", g.inter_chrom)
         } else {
             String::new()
         }
     );
     if g.counted == 0 {
-        return Err("表示範囲に接触が 1 つもありません。--x-start / --x-end / --max-distance を確認してください".into());
+        return Err(
+            "no contacts fall in the view; check --x-start / --x-end / --max-distance".into(),
+        );
     }
 
-    // --- 値変換と描画 ---
+    // --- Transform and draw ---
     let scale = Scale {
         log: !args.no_log,
         trim_quantile: if args.no_trim {
@@ -208,7 +211,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     };
     let values = render::transform(&g, &scale);
     eprintln!(
-        "      値のある画素 {} / {} ({:.1}%), 色域 {:.3}..{:.3}",
+        "      {} of {} pixels filled ({:.1}%), colour range {:.3}..{:.3}",
         values.filled,
         spec.pixels(),
         values.filled as f64 / spec.pixels() as f64 * 100.0,
@@ -218,20 +221,12 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(path) = &args.dump_grid {
         dump_grid(path, &g, &values)?;
-        eprintln!("      グリッドを書き出しました: {}", path.display());
+        eprintln!("      wrote the grid to {}", path.display());
     }
 
-    eprintln!("[3/3] 描画中: {}", args.output.display());
+    eprintln!("[3/3] drawing: {}", args.output.display());
     let font = font::pick(args.font.as_deref());
-    eprintln!(
-        "      フォント: {}{}",
-        font.family,
-        if font.cjk {
-            ""
-        } else {
-            " (日本語非対応のため英語ラベル)"
-        }
-    );
+    eprintln!("      font: {font}");
     let labels = Labels {
         title: args
             .title
@@ -253,28 +248,28 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         &labels,
         chroms.as_ref(),
     )?;
-    eprintln!("完了: {}", args.output.display());
+    eprintln!("done: {}", args.output.display());
     Ok(())
 }
 
-/// bp/bin を決める。明示指定 > 染色体長からの推定 > 不明 (軸は bin 単位) の順。
+/// Resolve bp/bin: explicit, else estimated from the lengths, else unknown.
 fn resolve_bin_size(
     args: &Args,
     extent: &grid::Extent,
 ) -> Result<Option<u32>, Box<dyn std::error::Error>> {
     if let Some(bs) = args.bin_size {
         if bs == 0 {
-            return Err("--bin-size は 1 以上で指定してください".into());
+            return Err("--bin-size must be at least 1".into());
         }
         return Ok(Some(bs));
     }
     let Some(path) = &args.lengths else {
-        return Ok(None); // 染色体長が無ければ bp へ換算できない
+        return Ok(None); // without lengths there is no way to convert to bp
     };
     let total_bp = ChromIndex::total_bp(path)?;
     let bs = chrom::estimate_bin_size(total_bp, extent.bin_max);
     eprintln!(
-        "      bin_size 推定: {bs} bp/bin (総 {total_bp} bp / 最大 bin {})",
+        "      bin_size estimated at {bs} bp/bin ({total_bp} bp over max bin {})",
         extent.bin_max
     );
     Ok(Some(bs))
@@ -286,7 +281,7 @@ fn report_geometry(spec: &GridSpec, bin_size: Option<u32>) {
         None => String::new(),
     };
     eprintln!(
-        "      表示範囲 bin {:.0}..{:.0}{} / 最大距離 {:.0} bin{}",
+        "      showing bins {:.0}..{:.0}{}, max distance {:.0} bins{}",
         spec.x0,
         spec.x1,
         bp(spec.x1 - spec.x0),
@@ -294,10 +289,10 @@ fn report_geometry(spec: &GridSpec, bin_size: Option<u32>) {
         bp(spec.max_distance)
     );
     let per_px = match bin_size {
-        Some(bs) => format!(" = {:.0} bp/画素", spec.dx * bs as f64),
+        Some(bs) => format!(" = {:.0} bp/pixel", spec.dx * bs as f64),
         None => String::new(),
     };
-    eprintln!("      解像度 {:.3} bin/画素{}", spec.dx, per_px);
+    eprintln!("      resolution {:.3} bins/pixel{}", spec.dx, per_px);
 }
 
 fn default_title(input: &Path) -> String {
@@ -308,8 +303,8 @@ fn default_title(input: &Path) -> String {
     format!("Hi-C contact map: {name}")
 }
 
-/// 集計結果を TSV で書き出す。値のない画素は行を出さない。
-/// x, y は画素中心の座標 (bin 単位)。y は回転座標 yr (= 距離 / 2)。
+/// Write the aggregate as TSV, skipping empty pixels. x and y are the pixel centre
+/// in bins; y is the rotated yr, i.e. half the distance.
 fn dump_grid(path: &Path, g: &grid::Grid, values: &render::Values) -> std::io::Result<()> {
     let file = std::fs::File::create(path)?;
     let mut w = std::io::BufWriter::new(file);

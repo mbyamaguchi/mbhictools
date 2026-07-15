@@ -1,42 +1,43 @@
-//! 接触データを回転座標の表示グリッド (= 画素) へ集計する。
+//! Aggregating contacts into a display grid in rotated coordinates.
 //!
-//! # なぜ回転座標か
+//! # Why rotate
 //!
-//! 入力は上三角成分のみ、かつ bin 間距離が上限 (既定では 1 Mbp) 以内に限られる。
-//! そのため素直な正方形の contact map を描くと、面積の大半が定義上まったく
-//! データのない領域になる。対角線に沿う細い帯だけが意味を持つ。
+//! The input holds only the upper triangle, and only within a distance limit
+//! (1 Mbp by default). A square contact map would therefore be mostly empty by
+//! construction: only a thin band along the diagonal carries data.
 //!
-//! そこで各接触を 45 度回した座標
-//!
-//! ```text
-//!   xr = (bin1 + bin2) / 2   ゲノム上の位置 (2 つの bin の中点)
-//!   yr = (bin2 - bin1) / 2   相互作用距離の半分
-//! ```
-//!
-//! へ写す。すると帯は「底辺 = ゲノム、高さ = 最大距離 / 2」の三角形になり、
-//! 画素が無駄にならない。
-//!
-//! # 画素数の決め方 (このモジュールの肝)
-//!
-//! `dx` を 1 画素あたりの bin 数とする。画素は正方形 (`dy == dx`) にとる。
-//! これはデータ単位で等方、つまり図の縦横比が実際の距離を正しく表すということ。
-//!
-//! ここで `nx` を上げ過ぎると破綻する。回転後の接触点は連続ではなく格子上にあり、
-//! しかもその格子は市松模様だからである。`bin1, bin2` が整数なので
-//! `xr, yr` は 0.5 の倍数だが、任意の組が現れるわけではない:
-//! `xr + yr = bin2` は必ず整数になるため、`xr + yr` が整数の点しか存在しない。
-//!
-//! この格子に対して 1 画素が `dx` 四方のとき、画素に入る格子点の数は:
+//! Rotating each contact by 45 degrees,
 //!
 //! ```text
-//!   dx = 1     : どの画素もちょうど 2 点 (xr,yr が共に整数の点と、共に半整数の点)
-//!   dx = 0.5   : (i+j) が偶数の画素だけ 1 点、奇数の画素は 0 点 → 完全な市松模様
-//!   dx >= 1    : 平均 2*dx^2 点。dx が大きいほど画素間のばらつきは相対的に小さい
+//!   xr = (bin1 + bin2) / 2   genomic position (midpoint of the two bins)
+//!   yr = (bin2 - bin1) / 2   half the interaction distance
 //! ```
 //!
-//! つまり `dx = 1 bin/画素` が厳密な下限で、これを下回ると空画素が交互に並ぶ
-//! モアレが出る。データが増えたわけでもないのに図が粗く見えるという最悪の失敗で、
-//! しかも「解像度を上げた」つもりで起きる。[`GridSpec::aliasing`] がこれを検出する。
+//! turns that band into a triangle whose base is the genome and whose height is half
+//! the distance limit, so no pixels are wasted.
+//!
+//! # Choosing the pixel count
+//!
+//! Let `dx` be the bins per pixel. Pixels are square (`dy == dx`), which keeps the
+//! figure isotropic in data units so its aspect ratio reports distance honestly.
+//!
+//! Raising `nx` too far breaks this. Rotated contacts do not land anywhere
+//! continuous; they land on a lattice, and that lattice is a checkerboard. `bin1` and
+//! `bin2` are integers, so `xr` and `yr` are multiples of 0.5 — but not every
+//! combination occurs, because `xr + yr = bin2` is always an integer. Only points
+//! with integral `xr + yr` exist.
+//!
+//! Against that lattice, a `dx`-square pixel contains:
+//!
+//! ```text
+//!   dx = 1     exactly 2 points in every pixel (one all-integer, one all-half)
+//!   dx = 0.5   1 point where (i+j) is even, 0 where odd: a full checkerboard
+//!   dx >= 1    2*dx^2 on average, and more uniform the larger dx is
+//! ```
+//!
+//! So `dx = 1 bin/pixel` is a hard floor. Below it, empty pixels alternate into
+//! moiré: the figure gets coarser even though no data changed, and it happens while
+//! "increasing the resolution". [`GridSpec::aliasing`] detects it.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -44,30 +45,30 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::chrom::ChromIndex;
 use crate::contact;
 
-/// 表示グリッドの幾何。すべて bin 単位 (bp ではない)。
+/// Grid geometry, all in bins (never bp).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GridSpec {
-    /// 表示するゲノム範囲 [x0, x1) (xr の範囲)。
+    /// Genomic range shown, [x0, x1), in `xr`.
     pub x0: f64,
     pub x1: f64,
-    /// 1 画素あたりの bin 数。縦横とも同じ (正方形画素)。
+    /// Bins per pixel, the same both ways (square pixels).
     pub dx: f64,
-    /// 横方向の画素数。
+    /// Pixels across.
     pub nx: usize,
-    /// 縦方向の画素数。`ymax / dx` から決まる。
+    /// Pixels up; follows from `ymax / dx`.
     pub ny: usize,
-    /// 三角形の高さ = max_distance / 2 (回転座標での縦の上限)。
+    /// Triangle height, `max_distance / 2`.
     pub ymax: f64,
-    /// 表示する最大の bin 間距離 |bin2 - bin1|。
+    /// Largest `|bin2 - bin1|` shown.
     pub max_distance: f64,
 }
 
-/// 画素が細か過ぎるときの診断。`nx` を上げ過ぎた結果として起きる。
+/// Diagnosis of pixels too fine for the lattice, i.e. `nx` set too high.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Aliasing {
-    /// 現在の 1 画素あたりの bin 数 (< 1)。
+    /// Current bins per pixel (< 1).
     pub dx: f64,
-    /// モアレを起こさない `nx` の上限。
+    /// Largest `nx` that avoids moiré.
     pub max_nx: usize,
 }
 
@@ -75,16 +76,16 @@ impl std::fmt::Display for Aliasing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "1 画素が {:.3} bin しかありません (< 1 bin/画素)。\n\
-             回転後の接触点は `xr + yr` が整数の格子上にしかないため、\n\
-             この解像度では空の画素が交互に並ぶ市松模様のモアレが出ます。\n\
-             この範囲では --nx {} 以下を指定してください",
+            "a pixel spans only {:.3} bins (< 1 bin/pixel).\n\
+             Rotated contacts exist only where `xr + yr` is an integer, so at this\n\
+             resolution empty pixels alternate into checkerboard moire.\n\
+             Use --nx {} or less for this range",
             self.dx, self.max_nx
         )
     }
 }
 
-/// データの広がり。`x_range` / `max_distance` を省略したときの自動決定に使う。
+/// Extent of the data, used to resolve an omitted range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Extent {
     pub bin_min: u32,
@@ -92,28 +93,28 @@ pub struct Extent {
     pub dist_max: u32,
 }
 
-/// 集計済みグリッド。`cells[py * nx + px]` に score の総和が入る。
+/// An aggregated grid. `cells[py * nx + px]` holds the summed score.
 #[derive(Debug, Clone)]
 pub struct Grid {
     pub spec: GridSpec,
     cells: Vec<u64>,
-    /// グリッドに実際に加算された接触の行数。
+    /// Rows added to the grid.
     pub counted: u64,
-    /// 表示範囲外だった行数。
+    /// Rows outside the view.
     pub out_of_range: u64,
-    /// 染色体境界を跨ぐために除外した行数 (フィルタ無効時は 0)。
+    /// Rows dropped for crossing a chromosome boundary (0 when not filtering).
     pub inter_chrom: u64,
 }
 
 impl GridSpec {
-    /// 表示範囲と横画素数から幾何を決める。
+    /// Derive the geometry from a range and a pixel width.
     ///
-    /// `ny` は正方形画素 (`dy == dx`) になるよう `ymax / dx` から導く。縦の画素数を
-    /// 独立に指定できないのは意図的で、そうしないと図の縦横比が距離を偽ってしまう。
+    /// `ny` follows from `ymax / dx` to keep pixels square. Height is deliberately
+    /// not settable on its own: that would let the aspect ratio misreport distance.
     pub fn new(x0: f64, x1: f64, max_distance: f64, nx: usize) -> Self {
-        assert!(nx >= 1, "nx は 1 以上であること");
-        assert!(x1 > x0, "表示範囲が空です: [{x0}, {x1})");
-        assert!(max_distance > 0.0, "max_distance は正であること");
+        assert!(nx >= 1, "nx must be at least 1");
+        assert!(x1 > x0, "empty range: [{x0}, {x1})");
+        assert!(max_distance > 0.0, "max_distance must be positive");
 
         let dx = (x1 - x0) / nx as f64;
         let ymax = max_distance / 2.0;
@@ -129,12 +130,12 @@ impl GridSpec {
         }
     }
 
-    /// 画素が細か過ぎて回転格子のモアレが出るなら、その診断を返す。
+    /// Report moire if the pixels are finer than the lattice supports.
     pub fn aliasing(&self) -> Option<Aliasing> {
         if self.dx >= 1.0 {
             return None;
         }
-        // dx >= 1 すなわち (x1 - x0) / nx >= 1 となる最大の nx。
+        // The largest nx with dx = (x1 - x0) / nx >= 1.
         let max_nx = (self.x1 - self.x0).floor().max(1.0) as usize;
         Some(Aliasing {
             dx: self.dx,
@@ -142,17 +143,15 @@ impl GridSpec {
         })
     }
 
-    /// 総画素数。
     pub fn pixels(&self) -> usize {
         self.nx * self.ny
     }
 
-    /// 接触 (bin1, bin2) が落ちる画素。表示範囲外なら `None`。
+    /// The pixel a contact lands in, or `None` if outside the view.
     ///
-    /// ゲノム位置は半開区間 [x0, x1)、距離は閉区間 [0, max_distance] で扱う。
-    /// 距離だけ閉じているのは「距離が 1 Mbp 以下・以内」という入力の仕様を
-    /// そのまま写すため。半開にすると上限ちょうどの接触 (実データでは
-    /// `bin2 - bin1 == 5000` の行) を丸ごと落としてしまう。
+    /// Position is half-open [x0, x1); distance is closed [0, max_distance]. Closing
+    /// distance mirrors the input spec ("within 1 Mbp"): half-open would discard
+    /// every contact sitting exactly on the limit (`bin2 - bin1 == 5000` in the data).
     #[inline]
     fn pixel_of(&self, bin1: u32, bin2: u32) -> Option<(usize, usize)> {
         let (b1, b2) = (bin1 as f64, bin2 as f64);
@@ -162,7 +161,7 @@ impl GridSpec {
             return None;
         }
         let px = ((xr - self.x0) / self.dx) as usize;
-        // 除算の丸めや、yr == ymax ちょうどの点が最上段を 1 つ踏み越えうる。
+        // Rounding, or yr sitting exactly on ymax, can overshoot the top row by one.
         let py = ((yr / self.dx) as usize).min(self.ny - 1);
         if px >= self.nx {
             return None;
@@ -170,7 +169,7 @@ impl GridSpec {
         Some((px, py))
     }
 
-    /// 画素の中心のゲノム座標 (bin 単位)。
+    /// Genomic coordinate of a pixel centre, in bins.
     pub fn pixel_center(&self, px: usize, py: usize) -> (f64, f64) {
         (
             self.x0 + (px as f64 + 0.5) * self.dx,
@@ -180,12 +179,12 @@ impl GridSpec {
 }
 
 impl Grid {
-    /// 集計済みの画素値からグリッドを組み立てる。走査の統計は 0 になる。
+    /// Build a grid from pre-aggregated cells. Scan counters are left at zero.
     pub fn from_parts(spec: GridSpec, cells: Vec<u64>) -> Self {
         assert_eq!(
             cells.len(),
             spec.pixels(),
-            "cells の長さが画素数と一致しません"
+            "cells do not match the pixel count"
         );
         Grid {
             spec,
@@ -196,7 +195,7 @@ impl Grid {
         }
     }
 
-    /// `cells[py * nx + px]`。
+    /// `cells[py * nx + px]`.
     pub fn get(&self, px: usize, py: usize) -> u64 {
         self.cells[py * self.spec.nx + px]
     }
@@ -205,16 +204,16 @@ impl Grid {
         &self.cells
     }
 
-    /// 0 でない画素の値だけを集めたもの (分位点の計算用)。
+    /// Values of the non-empty pixels, for computing quantiles.
     pub fn nonzero(&self) -> Vec<u64> {
         self.cells.iter().copied().filter(|&v| v > 0).collect()
     }
 }
 
-/// ファイルを 1 パス走査してデータの広がりを調べる。
+/// Scan the file once to measure the data.
 ///
-/// `x_range` や `max_distance` を省略したときに、グリッドを確保する前の
-/// 範囲決定に使う (score は見ないので集計本体より軽い)。
+/// Used to resolve an omitted range before allocating the grid. Scores are not read,
+/// so this is lighter than the aggregating pass.
 pub fn scan_extent(path: &Path) -> Result<Extent, contact::Error> {
     let bin_min = AtomicU32::new(u32::MAX);
     let bin_max = AtomicU32::new(0);
@@ -240,12 +239,12 @@ pub fn scan_extent(path: &Path) -> Result<Extent, contact::Error> {
     })
 }
 
-/// ファイルを 1 パス走査して `spec` のグリッドへ集計する。
+/// Scan the file once and aggregate it into `spec`.
 ///
-/// メモリはグリッドぶん (nx * ny * 8 バイト) のみで、行数には依存しない。
-/// score は整数なので u64 のアトミック加算で厳密かつ並列に足し込める。
+/// Memory is the grid alone (nx * ny * 8 bytes), independent of the row count.
+/// Integer scores add exactly, and atomically, into one shared grid.
 ///
-/// `chrom_filter` を渡すと、染色体境界を跨ぐ接触を除外する。
+/// `chrom_filter` drops contacts crossing a chromosome boundary.
 pub fn build(
     path: &Path,
     spec: GridSpec,
@@ -289,7 +288,7 @@ mod tests {
 
     #[test]
     fn derives_square_pixels() {
-        // ゲノム 1000 bin を 100 画素 -> 10 bin/画素。最大距離 200 bin -> 高さ 100 bin -> 10 画素。
+        // 1000 bins over 100 pixels = 10 bins/pixel; a 200 bin limit is 100 bins high.
         let s = GridSpec::new(0.0, 1000.0, 200.0, 100);
         assert_eq!(s.dx, 10.0);
         assert_eq!(s.ymax, 100.0);
@@ -299,7 +298,7 @@ mod tests {
 
     #[test]
     fn rounds_ny_up_to_cover_the_top() {
-        // ymax / dx = 105 / 10 = 10.5 -> 端を切り落とさないよう 11 画素。
+        // ymax / dx = 105 / 10 = 10.5, so 11 pixels rather than clipping the top.
         let s = GridSpec::new(0.0, 1000.0, 210.0, 100);
         assert_eq!(s.ny, 11);
     }
@@ -307,16 +306,15 @@ mod tests {
     #[test]
     fn maps_contacts_to_rotated_pixels() {
         let s = GridSpec::new(0.0, 1000.0, 200.0, 100);
-        // bin1=bin2=5 -> xr=5, yr=0 -> 対角 (px=0, py=0)
+        // bin1 = bin2 = 5: xr = 5, yr = 0, on the diagonal.
         assert_eq!(s.pixel_of(5, 5), Some((0, 0)));
-        // bin1=100, bin2=120 -> xr=110, yr=10 -> px=11, py=1
+        // bin1 = 100, bin2 = 120: xr = 110, yr = 10.
         assert_eq!(s.pixel_of(100, 120), Some((11, 1)));
-        // xr が右端 (x1) 以上は範囲外
+        // xr at or past x1 is outside.
         assert_eq!(s.pixel_of(1000, 1000), None);
-        // 距離が上限ちょうど (yr == ymax) の接触は最上段に含める (閉区間)
+        // Distance exactly on the limit (yr == ymax) belongs to the top row.
         assert_eq!(s.pixel_of(0, 200), Some((10, 9)));
-        // 上限を超えたものは範囲外
-        assert_eq!(s.pixel_of(0, 202), None);
+        assert_eq!(s.pixel_of(0, 202), None, "past the limit");
     }
 
     #[test]
@@ -326,16 +324,12 @@ mod tests {
         assert_eq!(s.pixel_center(11, 1), (115.0, 15.0));
     }
 
-    /// dx = 1 のとき、回転格子はどの画素にもちょうど 2 点を与える (モジュール doc の主張)。
+    /// The module doc's claim: at dx = 1 every pixel holds exactly 2 lattice points.
     #[test]
     fn unit_pixels_receive_exactly_two_lattice_points_each() {
         let s = GridSpec::new(0.0, 40.0, 20.0, 40);
         assert_eq!(s.dx, 1.0);
-        assert_eq!(
-            s.aliasing(),
-            None,
-            "dx = 1 は下限ちょうどで、モアレは出ない"
-        );
+        assert_eq!(s.aliasing(), None, "dx = 1 is the floor, not below it");
 
         let mut count = vec![0usize; s.pixels()];
         for b1 in 0..=60u32 {
@@ -345,15 +339,15 @@ mod tests {
                 }
             }
         }
-        // 三角形の内側 (端の切れる画素を避ける) はすべて 2 点ちょうど。
+        // Inside the triangle, away from the clipped edges, always exactly 2.
         for py in 0..5 {
             for px in 10..30 {
-                assert_eq!(count[py * s.nx + px], 2, "画素 ({px}, {py})");
+                assert_eq!(count[py * s.nx + px], 2, "pixel ({px}, {py})");
             }
         }
     }
 
-    /// dx < 1 では格子点の入らない画素が生じる (= 市松模様のモアレ)。
+    /// Below dx = 1, pixels start missing the lattice entirely: checkerboard moire.
     #[test]
     fn subunit_pixels_leave_empty_gaps() {
         let s = GridSpec::new(0.0, 40.0, 20.0, 80);
@@ -370,7 +364,7 @@ mod tests {
         let empty = count.iter().filter(|&&c| c == 0).count();
         assert!(
             empty > s.pixels() / 3,
-            "dx = 0.5 では約半数の画素が空になるはず (実際 {empty} / {})",
+            "dx = 0.5 should empty about half the pixels (got {empty} of {})",
             s.pixels()
         );
     }
@@ -378,14 +372,14 @@ mod tests {
     #[test]
     fn reports_aliasing_with_a_usable_nx_limit() {
         let s = GridSpec::new(0.0, 1000.0, 200.0, 4000);
-        let a = s.aliasing().expect("dx = 0.25 なのでモアレが出る");
+        let a = s.aliasing().expect("dx = 0.25 aliases");
         assert_eq!(a.dx, 0.25);
-        assert_eq!(a.max_nx, 1000, "1000 bin の範囲なら nx <= 1000");
+        assert_eq!(a.max_nx, 1000, "1000 bins allow at most nx = 1000");
     }
 
     #[test]
     fn no_aliasing_at_coarse_resolution() {
-        // 全ゲノム 62861 bin を 4000 画素 -> 約 15.7 bin/画素。
+        // A 62861 bin genome over 4000 pixels is about 15.7 bins/pixel.
         let s = GridSpec::new(0.0, 62861.0, 5000.0, 4000);
         assert!(s.aliasing().is_none());
         assert_eq!(s.ny, 160);
@@ -394,7 +388,7 @@ mod tests {
     #[test]
     fn aggregates_scores_per_pixel() {
         let path = std::env::temp_dir().join("mbhictools_grid.txt");
-        // 同じ画素 (px=11, py=1) に落ちる 2 行と、別の画素に落ちる 1 行。
+        // Two rows landing in one pixel, plus one elsewhere.
         std::fs::write(
             &path,
             "bin1\tbin2\tscore\n100\t120\t3\n101\t121\t4\n5\t5\t7\n",
@@ -404,7 +398,7 @@ mod tests {
         let s = GridSpec::new(0.0, 1000.0, 200.0, 100);
         let g = build(&path, s, None).unwrap();
 
-        assert_eq!(g.get(11, 1), 7, "同じ画素の score は足し合わされる");
+        assert_eq!(g.get(11, 1), 7, "scores in one pixel are summed");
         assert_eq!(g.get(0, 0), 7);
         assert_eq!(g.counted, 3);
         assert_eq!(g.out_of_range, 0);

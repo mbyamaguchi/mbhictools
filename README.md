@@ -1,121 +1,110 @@
 # mbhictools_rs
 
-Hi-C contact map のための Rust 製ツール集。
+Rust tools for Hi-C contact maps. Aggregation and rendering live in the
+`mbhictools_rs` library; commands live in `src/bin/`.
 
-集計と描画の実体はライブラリ (`mbhictools_rs`) 側にあり、コマンドは `src/bin/` に置く。
-
-| コマンド | 役割 |
+| Command | Purpose |
 | --- | --- |
-| `draw_hic` | 三角形 contact map を PNG に描く |
+| `draw_hic` | Draw a triangular contact map as PNG |
 
 ## draw_hic
 
-スパースな接触データ (`bin1<TAB>bin2<TAB>score`) をファイル 1 パスで表示グリッドへ
-集計し、回転座標の三角形 contact map として PNG に描く。1 億行超・数 GB の入力を
-定メモリ (グリッドぶんのみ) で扱う。
-
-`../hicb/src/plot_hic_triangle.R` の方針を Rust へ移したもの。
-
-### 使い方
+Aggregates sparse contacts (`bin1<TAB>bin2<TAB>score`) into a display grid in one
+pass over the file and renders them in rotated coordinates. Memory scales with the
+grid, not the row count, so 100M+ rows are fine. Ported from
+`../hicb/src/plot_hic_triangle.R`.
 
 ```sh
 cargo build --release
 
-# 全ゲノム
+# Whole genome
 ./target/release/draw_hic ../data/output_mix3.txt \
     --lengths ../data/pombe_length.txt --nx 4000 -o hicmap.png
 
-# 染色体 I だけを拡大 (bin 単位で指定する。bp ではない)
+# Zoom into chromosome I (ranges are in bins, not bp)
 ./target/release/draw_hic ../data/output_mix3.txt \
     --lengths ../data/pombe_length.txt \
     --x-start 1 --x-end 27897 --nx 3000 -o chr1.png
 ```
 
-`draw_hic --help` で全オプションを表示する。
+See `draw_hic --help` for all options.
 
-### 入力の前提
+### Input assumptions
 
-| 前提 | 意味 |
+| Assumption | Consequence |
 | --- | --- |
-| 上三角成分のみ (`bin1 <= bin2`) | 下三角は対称なので持たない |
-| `score` は 1 以上の整数 | 集計を u64 で厳密に行える (丸め誤差なし) |
-| bin 間距離が上限以内 (例: 1 Mbp) | 対角に沿う帯だけがデータを持つ |
+| Upper triangle only (`bin1 <= bin2`) | The lower triangle is symmetric and not stored |
+| `score` is an integer >= 1 | Scores sum exactly in u64, no rounding error |
+| Distance within a limit (e.g. 1 Mbp) | Only a band along the diagonal holds data |
 
-bin はゲノム全体を `bin_size` bp ごとに区切った通し番号 (1 始まり) であって bp ではない。
-`--lengths` に染色体長 (`chr<TAB>bp`) を与えると、`bin_size` を `総 bp / 最大 bin` から
-推定して軸を bp で目盛り、染色体境界を跨ぐ接触を除外して境界線を引く。
+Bins are 1-based indices over the concatenated genome in `bin_size` bp steps, not bp.
+Given `--lengths` (`chr<TAB>bp`), `bin_size` is estimated as total bp / max bin; axes
+are then labelled in bp, contacts crossing chromosome boundaries are dropped, and the
+boundaries are marked. For `../data/`, that is 200 bp/bin and a 5000 bin = 1 Mbp limit.
 
-同梱データ (`../data/*.txt`) では `bin_size = 200 bp`、最大距離 `5000 bin = 1 Mbp`。
+### Why a triangle
 
-### なぜ三角形か
-
-距離が上限以内に限られるため、正方形の contact map を描くと面積の大半が定義上
-データのない領域になる。各接触を 45 度回した座標
+With distance capped, a square map is mostly empty by construction. Rotating each
+contact by 45 degrees,
 
 ```
-xr = (bin1 + bin2) / 2    ゲノム上の位置 (2 つの bin の中点)
-yr = (bin2 - bin1) / 2    相互作用距離の半分
+xr = (bin1 + bin2) / 2    genomic position (midpoint of the two bins)
+yr = (bin2 - bin1) / 2    half the interaction distance
 ```
 
-へ写すと、帯は「底辺 = ゲノム、高さ = 最大距離 / 2」の三角形になり画素が無駄にならない。
-縦軸は `yr` ではなく実際の距離 (`2 * yr`) で目盛る。
+turns the band into a triangle whose base is the genome and whose height is half the
+distance limit, wasting no pixels. The y axis is labelled with the real distance
+(`2 * yr`).
 
-### 画素数について
+### Pixel count
 
-**`--nx` を上げ過ぎると、解像度が上がるどころか図が壊れる。**
+Raising `--nx` too far degrades the figure rather than resolving it. Rotated contacts
+land on a checkerboard lattice: `bin1` and `bin2` are integers, so `xr` and `yr` are
+multiples of 0.5, but `xr + yr = bin2` is always integral, so only points with
+integral `xr + yr` exist. With pixels `dx` bins square:
 
-回転後の接触点は連続ではなく格子上にあり、しかもその格子は市松模様になっている。
-`bin1, bin2` が整数なので `xr, yr` は 0.5 の倍数だが、`xr + yr = bin2` は必ず整数に
-なるため、**`xr + yr` が整数の点しか存在しない**。
-
-1 画素を `dx` bin 四方とすると、画素に入る格子点の数は:
-
-| `dx` | 画素あたりの格子点 |
+| `dx` | Lattice points per pixel |
 | --- | --- |
-| `1` | どの画素もちょうど 2 点 (均一) |
-| `0.5` | `(i+j)` が偶数の画素だけ 1 点、奇数の画素は 0 点 → **完全な市松模様** |
-| `>= 1` | 平均 `2 * dx^2` 点 |
+| 1 | Exactly 2 in every pixel (uniform) |
+| 0.5 | 1 where `i+j` is even, 0 where odd — a full checkerboard |
+| >= 1 | `2 * dx^2` on average |
 
-つまり **`dx = 1 bin/画素` が厳密な下限**で、これを下回ると空画素が交互に並ぶモアレが出る。
-実測でも、`dx = 0.25` にすると画素数は 16 倍になるのに値のある画素は 13 万 → 19 万に
-しか増えず、充填率は 66.4% → 5.9% へ落ちる。データが増えたわけでもないのに図だけが
-粗くなる。
+So `dx = 1 bin/pixel` is a hard floor; below it, empty pixels alternate into moiré.
+Measured: at `dx = 0.25` the pixel count is 16x higher but filled pixels only rise
+from 133k to 190k, so occupancy drops from 66.4% to 5.9%. `draw_hic` detects this,
+refuses to render by default, and reports the largest `--nx` usable for the range.
+`--allow-aliasing` overrides.
 
-本ツールはこれを検出して既定では**描画を拒否し、その範囲で使える `--nx` の上限を示す**。
-承知のうえで描くなら `--allow-aliasing`。
+Pixels are always square (`dy == dx`), so `ny` follows from `--nx` and the range.
+Height is deliberately not settable on its own, as that would let the aspect ratio
+misrepresent distance.
 
-画素は常に正方形 (`dy == dx`) にとり、`ny` は `--nx` と表示範囲から導く。縦の画素数を
-独立に指定できないのは意図的で、そうしないと図の縦横比が実際の距離を偽ってしまう。
+## Layout
 
-## 構成
-
-| モジュール | 役割 |
+| Module | Role |
 | --- | --- |
-| `contact` | 入力の並列パース (mmap + rayon、行境界で分割) |
-| `chrom` | 染色体長テーブルと global bin の対応 |
-| `grid` | 回転座標への集計と画素数の決定 |
-| `render` | 値変換 (log10・分位点クリップ)・配色・PNG 出力 |
-| `font` | ラベル描画に使えるフォントの選択 |
+| `contact` | Parallel parsing (mmap + rayon, split on line boundaries) |
+| `chrom` | Chromosome lengths and their global bin ranges |
+| `grid` | Aggregation in rotated coordinates; pixel geometry |
+| `render` | Value transform (log10, quantile clip), palette, PNG |
+| `font` | Picking a usable font for labels |
 
-集計は共有グリッドへの u64 アトミック加算で行う。`score` が整数なのでスレッドごとに
-グリッドを複製する必要がなく、結果も厳密に一致する (実測: グリッドの `raw` 総和が
-入力の `score` 総和と完全一致)。
+Aggregation uses u64 atomic adds into one shared grid. Integer scores mean no
+per-thread grid copies are needed and the result is exact: the summed `raw` of a
+dumped grid matches the summed `score` of the input.
 
-### フォント
+Passing `sans-serif` to plotters defers to fontconfig, which on some systems resolves
+to a font reporting zero Latin advance widths (e.g. Droid Sans Fallback); tick labels
+then vanish with no error. `font` measures text to pick a sane candidate, and falls
+back to English axis labels where no CJK font exists. `--font` overrides.
 
-plotters に `sans-serif` を渡すと fontconfig の代替解決に委ねられるが、環境によっては
-Latin の字送り幅を 0 として返すフォント (例: Droid Sans Fallback) に解決され、
-**エラーを出さないまま目盛りの数値だけが消える**。`font` モジュールは候補を順に当たり、
-実際に文字幅を測って正気なものを選ぶ。日本語を持たないフォントしか無い環境では
-軸名を英語へ切り替える (豆腐を出さない)。`--font` で明示指定もできる。
+## Performance
 
-## 性能
+On WSL2 with 8 threads:
 
-WSL2 / 8 スレッドでの実測:
-
-| 入力 | 行数 | 時間 |
+| Input | Rows | Time |
 | --- | --- | --- |
-| `output_NovaSeq.txt` (301 MB) | 2205 万 | 2.5 秒 |
-| `output_mix3.txt` (1.75 GB) | 1 億 2686 万 | 16.6 秒 |
+| `output_NovaSeq.txt` (301 MB) | 22.1M | 2.5 s |
+| `output_mix3.txt` (1.75 GB) | 126.9M | 16.6 s |
 
-ファイルは 2 パス走査する (1 回目で範囲と `bin_size` を決め、2 回目で集計する)。
+The file is scanned twice: once for ranges and `bin_size`, once to aggregate.

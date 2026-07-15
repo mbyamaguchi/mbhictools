@@ -1,17 +1,16 @@
-//! スパース接触ファイル (`bin1<TAB>bin2<TAB>score`) の並列読み込み。
+//! Parallel reading of a sparse contact file (`bin1<TAB>bin2<TAB>score`).
 //!
-//! 入力の前提 (本ツールが対象とするファイルの仕様):
-//!   - TSV, 1 行目はヘッダ (`bin1  bin2  score`)
-//!   - 上三角成分のみ (`bin1 <= bin2`)
-//!   - `score` は 1 以上の整数
-//!   - bin 間距離 `bin2 - bin1` は一定値以下 (例: 1 Mbp 相当)
+//! Assumed input:
+//!   - TSV whose first line is a header (`bin1  bin2  score`)
+//!   - upper triangle only (`bin1 <= bin2`)
+//!   - `score` is an integer >= 1
+//!   - `bin2 - bin1` is within some limit (e.g. 1 Mbp worth of bins)
 //!
-//! score が整数であることから、集計は f64 ではなく u64 で厳密に行える。
-//! これは丸め誤差がないだけでなく、アトミック加算による共有グリッドへの
-//! 並列集計 (=スレッドごとのグリッド複製が不要) を可能にする。
+//! Integer scores let callers accumulate in u64 rather than f64: exact, and cheap
+//! enough to add atomically into one shared grid, so no per-thread copies.
 //!
-//! ファイルは mmap して行境界で分割し、rayon で並列にパースする。
-//! 全レコードを保持することはなく、メモリはグリッドぶんのみ。
+//! The file is mmapped, split on line boundaries and parsed with rayon. Records are
+//! never retained, so memory stays proportional to the caller's grid.
 
 use std::fs::File;
 use std::path::Path;
@@ -19,23 +18,22 @@ use std::path::Path;
 use memmap2::Mmap;
 use rayon::prelude::*;
 
-/// 並列パース時に 1 タスクへ渡すおおよそのバイト数。行境界へ切り上げられる。
+/// Rough bytes per parallel task, rounded up to a line boundary.
 const CHUNK_BYTES: usize = 8 << 20;
 
-/// 1 パスの走査結果。`visit` へ渡した closure の呼ばれた回数と、壊れた行の数。
+/// Result of one pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScanStats {
-    /// 正常にパースできた行数。
+    /// Lines parsed successfully.
     pub rows: u64,
-    /// パースできず読み飛ばした行数。
+    /// Lines skipped because they could not be parsed.
     pub malformed: u64,
 }
 
-/// 読み込み時に起こりうるエラー。
 #[derive(Debug)]
 pub enum Error {
     Io(std::io::Error),
-    /// 壊れた行が多すぎる (ファイル形式の取り違えが疑われる)。
+    /// Too many bad lines, suggesting the file is not in the expected format.
     TooManyMalformed {
         path: String,
         malformed: u64,
@@ -46,15 +44,15 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Io(e) => write!(f, "入出力エラー: {e}"),
+            Error::Io(e) => write!(f, "I/O error: {e}"),
             Error::TooManyMalformed {
                 path,
                 malformed,
                 rows,
             } => write!(
                 f,
-                "{path}: パースできない行が多すぎます ({malformed} / {} 行)。\
-                 `bin1<TAB>bin2<TAB>score` 形式の TSV か確認してください",
+                "{path}: too many unparsable lines ({malformed} of {}). \
+                 Expected a TSV of `bin1<TAB>bin2<TAB>score`",
                 malformed + rows
             ),
         }
@@ -69,17 +67,17 @@ impl From<std::io::Error> for Error {
     }
 }
 
-/// ファイル全体を 1 パス走査し、各レコードで `visit(bin1, bin2, score)` を呼ぶ。
+/// Scan the file once, calling `visit(bin1, bin2, score)` for every record.
 ///
-/// `visit` は複数スレッドから同時に呼ばれる。呼び出し順は入力順とは限らない。
-/// 集計はアトミックか、可換な操作 (加算・min・max) に限ること。
+/// `visit` runs on many threads at once and not in file order, so it must only do
+/// atomic or commutative work (add, min, max).
 pub fn visit<F>(path: &Path, visit: F) -> Result<ScanStats, Error>
 where
     F: Fn(u32, u32, u32) + Sync,
 {
     let file = File::open(path)?;
-    // SAFETY: 読み込み専用に mmap する。走査中に外部からファイルが切り詰められると
-    // 未定義動作になりうるが、解析対象の入力ファイルは不変とみなす。
+    // SAFETY: mapped read-only. Truncating the file during the scan would be
+    // undefined behaviour; input files are treated as immutable.
     let mmap = unsafe { Mmap::map(&file)? };
 
     let body = skip_header(&mmap);
@@ -91,7 +89,7 @@ where
             malformed: a.malformed + b.malformed,
         });
 
-    // 数行の破損は許容するが、大半が読めないなら形式の取り違えとして落とす。
+    // A few bad lines are tolerable; mostly bad means the wrong format.
     if stats.malformed > 0 && stats.malformed * 2 > stats.rows {
         return Err(Error::TooManyMalformed {
             path: path.display().to_string(),
@@ -102,7 +100,7 @@ where
     Ok(stats)
 }
 
-/// 先頭行が数字で始まらなければヘッダとみなして読み飛ばす。
+/// Treat a first line that does not start with a digit as a header.
 fn skip_header(buf: &[u8]) -> &[u8] {
     match buf.first() {
         Some(b) if b.is_ascii_digit() => buf,
@@ -113,12 +111,12 @@ fn skip_header(buf: &[u8]) -> &[u8] {
     }
 }
 
-/// `buf` を行境界に揃った範囲へ分割する。各範囲は独立にパースできる。
+/// Split `buf` into line-aligned ranges that can be parsed independently.
 fn chunk_ranges(buf: &[u8]) -> Vec<(usize, usize)> {
     let mut ranges = Vec::with_capacity(buf.len() / CHUNK_BYTES + 1);
     let mut start = 0;
     while start < buf.len() {
-        // 目標位置から次の改行まで進め、行を跨がないようにする。
+        // Extend to the next newline so no chunk straddles a line.
         let target = (start + CHUNK_BYTES).min(buf.len());
         let end = match memchr_newline(buf, target) {
             Some(nl) => nl + 1,
@@ -151,7 +149,7 @@ where
     stats
 }
 
-/// `bin1<TAB>bin2<TAB>score` を 1 行パースする。3 列目より後ろは無視する。
+/// Parse one `bin1<TAB>bin2<TAB>score` line, ignoring anything after column 3.
 fn parse_line(line: &[u8]) -> Option<(u32, u32, u32)> {
     let mut fields = line.split(|&b| b == b'\t');
     let b1 = parse_u32(fields.next()?)?;
@@ -160,7 +158,7 @@ fn parse_line(line: &[u8]) -> Option<(u32, u32, u32)> {
     Some((b1, b2, score))
 }
 
-/// 10 進の符号なし整数をパースする。空文字列・非数字・桁溢れは `None`。
+/// Parse a decimal unsigned integer. Empty, non-digit or overflowing input is `None`.
 fn parse_u32(field: &[u8]) -> Option<u32> {
     if field.is_empty() {
         return None;
@@ -183,7 +181,7 @@ fn trim_cr(line: &[u8]) -> &[u8] {
     }
 }
 
-/// `from` 以降で最初の `\n` の位置。
+/// Offset of the first `\n` at or after `from`.
 fn memchr_newline(buf: &[u8], from: usize) -> Option<usize> {
     buf[from..]
         .iter()
@@ -210,11 +208,11 @@ mod tests {
 
     #[test]
     fn rejects_malformed_lines() {
-        assert_eq!(parse_line(b"27\t79"), None, "列が足りない");
-        assert_eq!(parse_line(b"27\t79\t1.5"), None, "score が整数でない");
-        assert_eq!(parse_line(b"27\t79\t"), None, "score が空");
-        assert_eq!(parse_line(b"a\tb\tc"), None, "数字でない");
-        assert_eq!(parse_line(b"27\t79\t-1"), None, "負の score");
+        assert_eq!(parse_line(b"27\t79"), None, "missing column");
+        assert_eq!(parse_line(b"27\t79\t1.5"), None, "score is not an integer");
+        assert_eq!(parse_line(b"27\t79\t"), None, "empty score");
+        assert_eq!(parse_line(b"a\tb\tc"), None, "not numeric");
+        assert_eq!(parse_line(b"27\t79\t-1"), None, "negative score");
     }
 
     #[test]
@@ -225,7 +223,7 @@ mod tests {
 
     #[test]
     fn visits_every_record_exactly_once() {
-        // ヘッダ + 末尾改行あり。score の総和で全件訪問を確認する。
+        // The score sum shows every record was seen, exactly once.
         let path = write_temp(
             "mbhictools_visit.txt",
             b"bin1\tbin2\tscore\n1\t2\t3\n4\t5\t6\n7\t8\t9\n",
@@ -263,7 +261,7 @@ mod tests {
     fn accepts_file_without_header() {
         let path = write_temp("mbhictools_noheader.txt", b"1\t2\t3\n");
         let stats = visit(&path, |_, _, _| {}).unwrap();
-        assert_eq!(stats.rows, 1, "数字で始まる先頭行はデータとして読む");
+        assert_eq!(stats.rows, 1, "a first line starting with a digit is data");
     }
 
     #[test]

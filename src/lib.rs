@@ -1,13 +1,13 @@
-//! Hi-C contact map の可視化。
+//! Hi-C contact map visualisation.
 //!
-//! スパースな接触データ (`bin1<TAB>bin2<TAB>score`) を 1 パスで表示グリッドへ
-//! 集計し、回転座標の三角形 contact map として PNG に描く。
+//! Aggregates sparse contacts (`bin1<TAB>bin2<TAB>score`) into a display grid in one
+//! pass and draws them as a triangular map in rotated coordinates.
 //!
-//! - [`contact`] 入力ファイルの並列パース
-//! - [`chrom`]   染色体長テーブルと global bin の対応
-//! - [`grid`]    回転座標への集計と画素数の決定
-//! - [`render`]  値変換・配色と PNG 出力
-//! - [`font`]    ラベル描画に使えるフォントの選択
+//! - [`contact`] parallel parsing of the input file
+//! - [`chrom`]   chromosome lengths and their global bin ranges
+//! - [`grid`]    aggregation in rotated coordinates; pixel geometry
+//! - [`render`]  value transform, palette and PNG output
+//! - [`font`]    picking a font whose metrics actually work
 
 pub mod chrom;
 pub mod contact;
